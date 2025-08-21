@@ -51,6 +51,7 @@ where
         scroll_handle: None,
         sizing_behavior: ListSizingBehavior::default(),
         horizontal_sizing_behavior: ListHorizontalSizingBehavior::default(),
+        header: None,
     }
 }
 
@@ -66,6 +67,7 @@ pub struct UniformList {
     scroll_handle: Option<UniformListScrollHandle>,
     sizing_behavior: ListSizingBehavior,
     horizontal_sizing_behavior: ListHorizontalSizingBehavior,
+    header: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
 }
 
 /// Frame state used by the [UniformList].
@@ -206,7 +208,10 @@ impl Element for UniformList {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
+        
+        let header_height = self.measure_header(window, cx);
         let item_size = self.measure_item(None, window, cx);
+        
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
@@ -218,7 +223,7 @@ impl Element for UniformList {
                         window.request_measured_layout(
                             style,
                             move |known_dimensions, available_space, _window, _cx| {
-                                let desired_height = item_size.height * max_items;
+                                let desired_height = header_height + item_size.height * max_items;
                                 let width = known_dimensions.width.unwrap_or(match available_space
                                     .width
                                 {
@@ -282,6 +287,7 @@ impl Element for UniformList {
             ListHorizontalSizingBehavior::Unconstrained
         );
 
+        let header_height = self.measure_header(window, cx);
         let longest_item_size = self.measure_item(None, window, cx);
         let content_width = if can_scroll_horizontally {
             padded_bounds.size.width.max(longest_item_size.width)
@@ -290,7 +296,7 @@ impl Element for UniformList {
         };
         let content_size = Size {
             width: content_width,
-            height: longest_item_size.height * self.item_count + padding.top + padding.bottom,
+            height: header_height + longest_item_size.height * self.item_count + padding.top + padding.bottom,
         };
 
         let shared_scroll_offset = self.interactivity.scroll_offset.clone().unwrap();
@@ -330,7 +336,7 @@ impl Element for UniformList {
                 };
 
                 if self.item_count > 0 {
-                    let content_height =
+                    let content_height = header_height +
                         item_height * self.item_count + padding.top + padding.bottom;
                     let is_scrolled_vertically = !scroll_offset.y.is_zero();
                     let min_vertical_scroll_offset = padded_bounds.size.height - content_height;
@@ -354,7 +360,7 @@ impl Element for UniformList {
                         }
                         let list_height = padded_bounds.size.height;
                         let mut updated_scroll_offset = shared_scroll_offset.borrow_mut();
-                        let item_top = item_height * ix + padding.top;
+                        let item_top = header_height + item_height * ix + padding.top;
                         let item_bottom = item_top + item_height;
                         let scroll_top = -updated_scroll_offset.y;
                         let offset_pixels = item_height * deferred_scroll.offset;
@@ -392,11 +398,24 @@ impl Element for UniformList {
                         scroll_offset = *updated_scroll_offset
                     }
 
-                    let first_visible_element_ix =
-                        (-(scroll_offset.y + padding.top) / item_height).floor() as usize;
-                    let last_visible_element_ix = ((-scroll_offset.y + padded_bounds.size.height)
-                        / item_height)
-                        .ceil() as usize;
+                    // Calculate visible range accounting for header
+                    let scroll_top = -scroll_offset.y;
+                    let viewport_top = scroll_top + padding.top;
+                    let viewport_bottom = viewport_top + padded_bounds.size.height;
+                    
+                    let items_start = header_height;
+                    
+                    let first_visible_element_ix = if viewport_top < items_start {
+                        0
+                    } else {
+                        ((viewport_top - items_start) / item_height).floor() as usize
+                    };
+                    
+                    let last_visible_element_ix = if viewport_bottom <= items_start {
+                        0
+                    } else {
+                        ((viewport_bottom - items_start) / item_height).ceil() as usize
+                    };
 
                     let visible_range = first_visible_element_ix
                         ..cmp::min(last_visible_element_ix, self.item_count);
@@ -413,6 +432,30 @@ impl Element for UniformList {
 
                     let content_mask = ContentMask { bounds };
                     window.with_content_mask(Some(content_mask), |window| {
+                        // Render header if visible
+                        if viewport_top < header_height && self.header.is_some() {
+                            let mut header_elem = (self.header.as_ref().unwrap())(window, cx);
+                            header_elem.layout_as_root(
+                                size(
+                                    AvailableSpace::Definite(padded_bounds.size.width),
+                                    AvailableSpace::Definite(header_height),
+                                ),
+                                window,
+                                cx,
+                            );
+                            let header_origin = padded_bounds.origin
+                                + point(
+                                    if can_scroll_horizontally {
+                                        scroll_offset.x + padding.left
+                                    } else {
+                                        scroll_offset.x
+                                    },
+                                    scroll_offset.y + padding.top,
+                                );
+                            header_elem.prepaint_at(header_origin, window, cx);
+                            frame_state.decorations.push(header_elem);
+                        }
+                        
                         for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
                             let item_origin = padded_bounds.origin
                                 + point(
@@ -421,7 +464,7 @@ impl Element for UniformList {
                                     } else {
                                         scroll_offset.x
                                     },
-                                    item_height * ix + scroll_offset.y + padding.top,
+                                    header_height + item_height * ix + scroll_offset.y + padding.top,
                                 );
                             let available_width = if can_scroll_horizontally {
                                 padded_bounds.size.width + scroll_offset.x.abs()
@@ -530,6 +573,29 @@ pub trait UniformListDecoration {
 }
 
 impl UniformList {
+    /// Add a fixed-size header element to the list.
+    pub fn with_header(
+        mut self,
+        header_fn: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.header = Some(Box::new(header_fn));
+        self
+    }
+
+    fn measure_header(&self, window: &mut Window, cx: &mut App) -> Pixels {
+        if let Some(header_fn) = &self.header {
+            let mut elem = (header_fn)(window, cx);
+            let size = elem.layout_as_root(
+                size(AvailableSpace::MinContent, AvailableSpace::MinContent),
+                window,
+                cx,
+            );
+            size.height
+        } else {
+            Pixels::ZERO
+        }
+    }
+
     /// Selects a specific list item for measurement.
     pub fn with_width_from_item(mut self, item_index: Option<usize>) -> Self {
         self.item_to_measure_index = item_index.unwrap_or(0);
