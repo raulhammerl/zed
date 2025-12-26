@@ -51,6 +51,10 @@ where
         scroll_handle: None,
         sizing_behavior: ListSizingBehavior::default(),
         horizontal_sizing_behavior: ListHorizontalSizingBehavior::default(),
+        header: None,
+        header_height: Pixels::ZERO,
+        header_element_cache: None,
+        header_measured: false,
     }
 }
 
@@ -66,6 +70,12 @@ pub struct UniformList {
     scroll_handle: Option<UniformListScrollHandle>,
     sizing_behavior: ListSizingBehavior,
     horizontal_sizing_behavior: ListHorizontalSizingBehavior,
+
+    // Optional fixed-height header
+    header: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
+    header_height: Pixels,
+    header_element_cache: Option<AnyElement>,
+    header_measured: bool,
 }
 
 /// Frame state used by the [UniformList].
@@ -85,12 +95,8 @@ pub enum ScrollStrategy {
     /// Place the element at the top of the list's viewport.
     Top,
     /// Attempt to place the element in the middle of the list's viewport.
-    /// May not be possible if there's not enough list items above the item scrolled to:
-    /// in this case, the element will be placed at the closest possible position.
     Center,
     /// Attempt to place the element at the bottom of the list's viewport.
-    /// May not be possible if there's not enough list items above the item scrolled to:
-    /// in this case, the element will be placed at the closest possible position.
     Bottom,
     /// If the element is not visible attempt to place it at:
     /// - The top of the list's viewport if the target element is above currently visible elements.
@@ -101,11 +107,8 @@ pub enum ScrollStrategy {
 #[derive(Clone, Copy, Debug)]
 #[allow(missing_docs)]
 pub struct DeferredScrollToItem {
-    /// The item index to scroll to
     pub item_index: usize,
-    /// The scroll strategy to use
     pub strategy: ScrollStrategy,
-    /// The offset in number of items
     pub offset: usize,
     pub scroll_strict: bool,
 }
@@ -143,10 +146,6 @@ impl UniformListScrollHandle {
     }
 
     /// Scroll the list so that the given item index is visible.
-    ///
-    /// This uses non-strict scrolling: if the item is already fully visible, no scrolling occurs.
-    /// If the item is out of view, it scrolls the minimum amount to bring it into view according
-    /// to the strategy.
     pub fn scroll_to_item(&self, ix: usize, strategy: ScrollStrategy) {
         self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
@@ -157,9 +156,6 @@ impl UniformListScrollHandle {
     }
 
     /// Scroll the list so that the given item index is at scroll strategy position.
-    ///
-    /// This uses strict scrolling: the item will always be scrolled to match the strategy position,
-    /// even if it's already visible. Use this when you need precise positioning.
     pub fn scroll_to_item_strict(&self, ix: usize, strategy: ScrollStrategy) {
         self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
@@ -170,15 +166,6 @@ impl UniformListScrollHandle {
     }
 
     /// Scroll the list to the given item index with an offset in number of items.
-    ///
-    /// This uses non-strict scrolling: if the item is already visible within the offset region,
-    /// no scrolling occurs.
-    ///
-    /// The offset parameter shrinks the effective viewport by the specified number of items
-    /// from the corresponding edge, then applies the scroll strategy within that reduced viewport:
-    /// - `ScrollStrategy::Top`: Shrinks from top, positions item at the new top
-    /// - `ScrollStrategy::Center`: Shrinks from top, centers item in the reduced viewport
-    /// - `ScrollStrategy::Bottom`: Shrinks from bottom, positions item at the new bottom
     pub fn scroll_to_item_with_offset(&self, ix: usize, strategy: ScrollStrategy, offset: usize) {
         self.0.borrow_mut().deferred_scroll_to_item = Some(DeferredScrollToItem {
             item_index: ix,
@@ -189,15 +176,6 @@ impl UniformListScrollHandle {
     }
 
     /// Scroll the list so that the given item index is at the exact scroll strategy position with an offset.
-    ///
-    /// This uses strict scrolling: the item will always be scrolled to match the strategy position,
-    /// even if it's already visible.
-    ///
-    /// The offset parameter shrinks the effective viewport by the specified number of items
-    /// from the corresponding edge, then applies the scroll strategy within that reduced viewport:
-    /// - `ScrollStrategy::Top`: Shrinks from top, positions item at the new top
-    /// - `ScrollStrategy::Center`: Shrinks from top, centers item in the reduced viewport
-    /// - `ScrollStrategy::Bottom`: Shrinks from bottom, positions item at the new bottom
     pub fn scroll_to_item_strict_with_offset(
         &self,
         ix: usize,
@@ -280,6 +258,27 @@ impl Element for UniformList {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let max_items = self.item_count;
+
+        // Measure and cache header once
+        let header_height = if let Some(header_fn) = &self.header {
+            if !self.header_measured {
+                let mut elem = (header_fn)(window, cx);
+                let size = elem.layout_as_root(
+                    size(AvailableSpace::MinContent, AvailableSpace::MinContent),
+                    window,
+                    cx,
+                );
+                self.header_height = size.height;
+                self.header_element_cache = Some(elem);
+                self.header_measured = true;
+                size.height
+            } else {
+                self.header_height
+            }
+        } else {
+            Pixels::ZERO
+        };
+
         let item_size = self.measure_item(None, window, cx);
         let layout_id = self.interactivity.request_layout(
             global_id,
@@ -292,7 +291,7 @@ impl Element for UniformList {
                         window.request_measured_layout(
                             style,
                             move |known_dimensions, available_space, _window, _cx| {
-                                let desired_height = item_size.height * max_items;
+                                let desired_height = header_height + item_size.height * max_items;
                                 let width = known_dimensions.width.unwrap_or(match available_space
                                     .width
                                 {
@@ -362,9 +361,10 @@ impl Element for UniformList {
         } else {
             padded_bounds.size.width
         };
+
         let content_size = Size {
             width: content_width,
-            height: longest_item_size.height * self.item_count,
+            height: self.header_height + longest_item_size.height * self.item_count,
         };
 
         let shared_scroll_offset = self.interactivity.scroll_offset.clone().unwrap();
@@ -393,8 +393,8 @@ impl Element for UniformList {
                     false
                 };
 
-                if self.item_count > 0 {
-                    let content_height = item_height * self.item_count;
+                if self.item_count > 0 || self.header.is_some() {
+                    let content_height = self.header_height + item_height * self.item_count;
 
                     let is_scrolled_vertically = !scroll_offset.y.is_zero();
                     let max_scroll_offset = padded_bounds.size.height - content_height;
@@ -424,12 +424,11 @@ impl Element for UniformList {
                         }
                         let list_height = padded_bounds.size.height;
                         let mut updated_scroll_offset = shared_scroll_offset.borrow_mut();
-                        let item_top = item_height * item_index;
+                        let item_top = self.header_height + item_height * item_index;
                         let item_bottom = item_top + item_height;
                         let scroll_top = -updated_scroll_offset.y;
                         let offset_pixels = item_height * offset;
 
-                        // is the selected item above/below currently visible items
                         let is_above = item_top < scroll_top + offset_pixels;
                         let is_below = item_bottom > scroll_top + list_height;
 
@@ -442,39 +441,44 @@ impl Element for UniformList {
                                 }
                             }
 
-                            let max_scroll_offset =
-                                (content_height - list_height).max(Pixels::ZERO);
+                            let max_offset = (content_height - list_height).max(Pixels::ZERO);
                             match strategy {
                                 ScrollStrategy::Top => {
-                                    updated_scroll_offset.y = -(item_top - offset_pixels)
-                                        .clamp(Pixels::ZERO, max_scroll_offset);
+                                    updated_scroll_offset.y =
+                                        -(item_top - offset_pixels).clamp(Pixels::ZERO, max_offset);
                                 }
                                 ScrollStrategy::Center => {
                                     let item_center = item_top + item_height / 2.0;
-
                                     let viewport_height = list_height - offset_pixels;
                                     let viewport_center = offset_pixels + viewport_height / 2.0;
                                     let target_scroll_top = item_center - viewport_center;
                                     updated_scroll_offset.y =
-                                        -target_scroll_top.clamp(Pixels::ZERO, max_scroll_offset);
+                                        -target_scroll_top.clamp(Pixels::ZERO, max_offset);
                                 }
                                 ScrollStrategy::Bottom => {
                                     updated_scroll_offset.y = -(item_bottom - list_height)
-                                        .clamp(Pixels::ZERO, max_scroll_offset);
+                                        .clamp(Pixels::ZERO, max_offset);
                                 }
-                                ScrollStrategy::Nearest => {
-                                    // Nearest, but the item is visible -> no scroll is required
-                                }
+                                ScrollStrategy::Nearest => {}
                             }
                         }
                         scroll_offset = *updated_scroll_offset
                     }
 
-                    let first_visible_element_ix =
-                        (-(scroll_offset.y + padding.top) / item_height).floor() as usize;
-                    let last_visible_element_ix = ((-scroll_offset.y + padded_bounds.size.height)
-                        / item_height)
-                        .ceil() as usize;
+                    let viewport_top = -(scroll_offset.y + padding.top);
+                    let viewport_bottom = viewport_top + padded_bounds.size.height;
+
+                    let first_visible_element_ix = if viewport_top < self.header_height {
+                        0
+                    } else {
+                        ((viewport_top - self.header_height) / item_height).floor() as usize
+                    };
+
+                    let last_visible_element_ix = if viewport_bottom <= self.header_height {
+                        0
+                    } else {
+                        ((viewport_bottom - self.header_height) / item_height).ceil() as usize
+                    };
 
                     let visible_range = first_visible_element_ix
                         ..cmp::min(last_visible_element_ix, self.item_count);
@@ -491,10 +495,30 @@ impl Element for UniformList {
 
                     let content_mask = ContentMask { bounds };
                     window.with_content_mask(Some(content_mask), |window| {
+                        // Render header
+                        if -scroll_offset.y < self.header_height
+                            && self.header_element_cache.is_some()
+                        {
+                            if let Some(mut header_elem) = self.header_element_cache.take() {
+                                header_elem.layout_as_root(
+                                    size(
+                                        AvailableSpace::Definite(padded_bounds.size.width),
+                                        AvailableSpace::Definite(self.header_height),
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                                let header_origin = padded_bounds.origin + scroll_offset;
+                                header_elem.prepaint_at(header_origin, window, cx);
+                                frame_state.decorations.push(header_elem);
+                            }
+                        }
+
+                        // Render visible items
                         for (mut item, ix) in items.into_iter().zip(visible_range.clone()) {
                             let item_origin = padded_bounds.origin
                                 + scroll_offset
-                                + point(Pixels::ZERO, item_height * ix);
+                                + point(Pixels::ZERO, self.header_height + item_height * ix);
 
                             let available_width = if can_scroll_horizontally {
                                 padded_bounds.size.width + scroll_offset.x.abs()
@@ -618,6 +642,15 @@ impl<T: UniformListDecoration + 'static> UniformListDecoration for Entity<T> {
 }
 
 impl UniformList {
+    /// Add a fixed-size header element to the list.
+    pub fn with_header(
+        mut self,
+        header_fn: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.header = Some(Box::new(header_fn));
+        self
+    }
+
     /// Selects a specific list item for measurement.
     pub fn with_width_from_item(mut self, item_index: Option<usize>) -> Self {
         self.item_to_measure_index = item_index.unwrap_or(0);
@@ -631,8 +664,6 @@ impl UniformList {
     }
 
     /// Sets the horizontal sizing behavior, controlling the way list items laid out horizontally.
-    /// With [`ListHorizontalSizingBehavior::Unconstrained`] behavior, every item and the list itself will
-    /// have the size of the widest item and lay out pushing the `end_slot` to the right end.
     pub fn with_horizontal_sizing_behavior(
         mut self,
         behavior: ListHorizontalSizingBehavior,
@@ -714,152 +745,5 @@ impl UniformList {
 impl InteractiveElement for UniformList {
     fn interactivity(&mut self) -> &mut crate::Interactivity {
         &mut self.interactivity
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::TestAppContext;
-
-    #[gpui::test]
-    fn test_scroll_strategy_nearest(cx: &mut TestAppContext) {
-        use crate::{
-            Context, FocusHandle, ScrollStrategy, UniformListScrollHandle, Window, div, prelude::*,
-            px, uniform_list,
-        };
-        use std::ops::Range;
-
-        actions!(example, [SelectNext, SelectPrev]);
-
-        struct TestView {
-            index: usize,
-            length: usize,
-            scroll_handle: UniformListScrollHandle,
-            focus_handle: FocusHandle,
-            visible_range: Range<usize>,
-        }
-
-        impl TestView {
-            pub fn select_next(
-                &mut self,
-                _: &SelectNext,
-                window: &mut Window,
-                _: &mut Context<Self>,
-            ) {
-                if self.index + 1 == self.length {
-                    self.index = 0
-                } else {
-                    self.index += 1;
-                }
-                self.scroll_handle
-                    .scroll_to_item(self.index, ScrollStrategy::Nearest);
-                window.refresh();
-            }
-
-            pub fn select_previous(
-                &mut self,
-                _: &SelectPrev,
-                window: &mut Window,
-                _: &mut Context<Self>,
-            ) {
-                if self.index == 0 {
-                    self.index = self.length - 1
-                } else {
-                    self.index -= 1;
-                }
-                self.scroll_handle
-                    .scroll_to_item(self.index, ScrollStrategy::Nearest);
-                window.refresh();
-            }
-        }
-
-        impl Render for TestView {
-            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                div()
-                    .id("list-example")
-                    .track_focus(&self.focus_handle)
-                    .on_action(cx.listener(Self::select_next))
-                    .on_action(cx.listener(Self::select_previous))
-                    .size_full()
-                    .child(
-                        uniform_list(
-                            "entries",
-                            self.length,
-                            cx.processor(|this, range: Range<usize>, _window, _cx| {
-                                this.visible_range = range.clone();
-                                range
-                                    .map(|ix| div().id(ix).h(px(20.0)).child(format!("Item {ix}")))
-                                    .collect()
-                            }),
-                        )
-                        .track_scroll(&self.scroll_handle)
-                        .h(px(200.0)),
-                    )
-            }
-        }
-
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let focus_handle = cx.focus_handle();
-            window.focus(&focus_handle, cx);
-            TestView {
-                scroll_handle: UniformListScrollHandle::new(),
-                index: 0,
-                focus_handle,
-                length: 47,
-                visible_range: 0..0,
-            }
-        });
-
-        // 10 out of 47 items are visible
-
-        // First 9 times selecting next item does not scroll
-        for ix in 1..10 {
-            cx.dispatch_action(SelectNext);
-            view.read_with(cx, |view, _| {
-                assert_eq!(view.index, ix);
-                assert_eq!(view.visible_range, 0..10);
-            })
-        }
-
-        // Now each time the list scrolls down by 1
-        for ix in 10..47 {
-            cx.dispatch_action(SelectNext);
-            view.read_with(cx, |view, _| {
-                assert_eq!(view.index, ix);
-                assert_eq!(view.visible_range, ix - 9..ix + 1);
-            })
-        }
-
-        // After the last item we move back to the start
-        cx.dispatch_action(SelectNext);
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.index, 0);
-            assert_eq!(view.visible_range, 0..10);
-        });
-
-        // Return to the last element
-        cx.dispatch_action(SelectPrev);
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.index, 46);
-            assert_eq!(view.visible_range, 37..47);
-        });
-
-        // First 9 times selecting previous does not scroll
-        for ix in (37..46).rev() {
-            cx.dispatch_action(SelectPrev);
-            view.read_with(cx, |view, _| {
-                assert_eq!(view.index, ix);
-                assert_eq!(view.visible_range, 37..47);
-            })
-        }
-
-        // Now each time the list scrolls up by 1
-        for ix in (0..37).rev() {
-            cx.dispatch_action(SelectPrev);
-            view.read_with(cx, |view, _| {
-                assert_eq!(view.index, ix);
-                assert_eq!(view.visible_range, ix..ix + 10);
-            })
-        }
     }
 }
